@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# claudegrep — Search Claude Code conversation logs
+#
+# Usage:
+#   claudegrep <pattern>              # search all messages (user + assistant)
+#   claudegrep -u <pattern>           # search user messages only
+#   claudegrep -a <pattern>           # search assistant/agent messages only
+#   claudegrep -p <project> <pattern> # search specific project
+#   claudegrep -n <N> <pattern>       # limit to N results (default: 25)
+#   claudegrep --list-projects        # list available projects
+#
+# Flags can be combined: claudegrep -un 10 "inngest"
+# Output is paged through less by default. Use --no-pager to disable.
+
+set -euo pipefail
+
+# --- Colors (truecolor) -----------------------------------------------
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+
+# Truecolor palette
+ORANGE='\033[38;2;255;150;50m'       # warm orange for highlights/matches
+PEACH='\033[38;2;255;180;120m'       # soft peach
+CORAL='\033[38;2;255;120;100m'       # coral accent
+TEAL='\033[38;2;100;220;200m'        # session topic
+SLATE='\033[38;2;130;150;170m'       # metadata/dim text
+SKY='\033[38;2;120;180;255m'         # branch names
+LAVENDER='\033[38;2;180;160;255m'    # claude badge
+MINT='\033[38;2;120;230;170m'        # user badge
+CLOUD='\033[38;2;80;90;105m'         # box borders
+WHITE='\033[38;2;230;235;240m'       # primary text
+FAINT='\033[38;2;90;100;110m'        # very subtle
+GOLD='\033[38;2;220;190;100m'        # time range
+
+# Background accents
+BG_BOX='\033[48;2;25;32;42m'         # dark bg for session box
+BG_RESET='\033[49m'
+
+BOX_W=68  # inner width of session header box
+
+CLAUDE_DIR="${HOME}/.claude/projects"
+
+# --- Defaults ---------------------------------------------------------
+filter_mode="both"  # "both", "user", "agent"
+max_results=25
+project_filter=""
+pattern=""
+use_pager=true
+
+usage() {
+  echo -e "${BOLD}${TEAL}claudegrep${RESET} ${SLATE}— Search Claude Code conversation logs${RESET}"
+  echo ""
+  echo -e "  ${WHITE}Usage:${RESET} claudegrep [options] ${ITALIC}<pattern>${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Options${RESET}"
+  echo -e "    ${MINT}-u${RESET}            Search user messages only."
+  echo -e "    ${MINT}-a${RESET}            Search assistant/agent messages only."
+  echo -e "    ${MINT}-n${RESET} ${ITALIC}<N>${RESET}        Max results to show (default: 25)."
+  echo -e "    ${MINT}-p${RESET} ${ITALIC}<project>${RESET}  Filter to a specific project (substring match)."
+  echo -e "    ${MINT}--list-projects${RESET}   List available projects and exit."
+  echo -e "    ${MINT}--no-pager${RESET}    Disable paging (default: pipes through less)."
+  echo -e "    ${MINT}-h, --help${RESET}    Show this help."
+  echo ""
+  echo -e "  ${BOLD}Examples${RESET}"
+  echo -e "    ${SLATE}\$${RESET} claudegrep ${ORANGE}\"inngest\"${RESET}           ${FAINT}# all messages mentioning inngest${RESET}"
+  echo -e "    ${SLATE}\$${RESET} claudegrep -u ${ORANGE}\"bulk price\"${RESET}     ${FAINT}# user messages only${RESET}"
+  echo -e "    ${SLATE}\$${RESET} claudegrep -a ${ORANGE}\"bulk price\"${RESET}     ${FAINT}# agent/assistant messages only${RESET}"
+  echo -e "    ${SLATE}\$${RESET} claudegrep -p manapool ${ORANGE}\"auth\"${RESET}  ${FAINT}# only manapool project${RESET}"
+  echo -e "    ${SLATE}\$${RESET} claudegrep -n 5 ${ORANGE}\"TODO\"${RESET}         ${FAINT}# first 5 matches${RESET}"
+  exit 0
+}
+
+list_projects() {
+  echo -e "${BOLD}${TEAL}Claude Code Projects${RESET}"
+  echo ""
+  for dir in "${CLAUDE_DIR}"/*/; do
+    [[ -d "$dir" ]] || continue
+    local name
+    name=$(basename "$dir")
+    local count
+    count=$(find "$dir" -name "*.jsonl" -not -path "*/subagents/*" 2>/dev/null | wc -l | tr -d ' ')
+    printf "  ${SKY}%-50s${RESET} ${SLATE}%3s sessions${RESET}\n" "$name" "$count"
+  done
+  exit 0
+}
+
+# --- Parse args -------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage ;;
+    --no-pager) use_pager=false; shift ;;
+    --list-projects) list_projects ;;
+    -u) filter_mode="user"; shift ;;
+    -a) filter_mode="agent"; shift ;;
+    -n)
+      shift
+      max_results="${1:?'-n requires a number'}"
+      shift
+      ;;
+    -p)
+      shift
+      project_filter="${1:?'-p requires a project name'}"
+      shift
+      ;;
+    -*)
+      flags="${1#-}"
+      shift
+      while [[ -n "$flags" ]]; do
+        f="${flags:0:1}"
+        flags="${flags:1}"
+        case "$f" in
+          u) filter_mode="user" ;;
+          a) filter_mode="agent" ;;
+          n)
+            if [[ -n "$flags" ]]; then
+              max_results="$flags"
+              flags=""
+            else
+              max_results="${1:?'-n requires a number'}"
+              shift
+            fi
+            ;;
+          p)
+            if [[ -n "$flags" ]]; then
+              project_filter="$flags"
+              flags=""
+            else
+              project_filter="${1:?'-p requires a project name'}"
+              shift
+            fi
+            ;;
+          *) echo "Unknown flag: -$f" >&2; exit 1 ;;
+        esac
+      done
+      ;;
+    *)
+      pattern="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$pattern" ]]; then
+  echo -e "${CORAL}${BOLD}Error:${RESET} ${WHITE}no search pattern provided${RESET}" >&2
+  echo -e "${SLATE}Usage: claudegrep [options] <pattern>${RESET}" >&2
+  exit 1
+fi
+
+# --- Build find path --------------------------------------------------
+search_paths=("$CLAUDE_DIR")
+if [[ -n "$project_filter" ]]; then
+  matches=()
+  for dir in "${CLAUDE_DIR}"/*/; do
+    if [[ "$dir" == *"$project_filter"* ]]; then
+      matches+=("$dir")
+    fi
+  done
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo -e "${CORAL}No projects matching '${project_filter}'${RESET}" >&2
+    exit 1
+  fi
+  search_paths=("${matches[@]}")
+fi
+
+# --- Build jq filter --------------------------------------------------
+case "$filter_mode" in
+  user)  type_filter='select(.type == "user")' ;;
+  agent) type_filter='select(.type == "assistant")' ;;
+  *)     type_filter='select(.type == "user" or .type == "assistant")' ;;
+esac
+
+jq_filter='
+  '"$type_filter"'
+  | . as $msg
+  | .message.content
+  | if type == "string" then [.]
+    else [.[] | select(.type == "text") | .text]
+    end
+  | .[]
+  | select(test($pat; "i"))
+  | {
+      text: .,
+      type: $msg.type,
+      timestamp: $msg.timestamp,
+      branch: ($msg.gitBranch // null),
+      cwd: ($msg.cwd // null),
+      sessionId: ($msg.sessionId // null),
+      uuid: ($msg.uuid // null)
+    }
+'
+
+# --- Execute search ----------------------------------------------------
+results=$(
+  find "${search_paths[@]}" -name "*.jsonl" -not -path "*/subagents/*" -print0 2>/dev/null \
+    | xargs -0 rg --no-filename -i -e "$pattern" 2>/dev/null \
+    | jq -c --arg pat "$pattern" "$jq_filter" 2>/dev/null \
+    | head -n "$max_results"
+) || true
+
+if [[ -z "$results" ]]; then
+  echo ""
+  echo -e "  ${SLATE}No matches for${RESET} ${ORANGE}${BOLD}/${pattern}/${RESET}"
+  echo ""
+  exit 0
+fi
+
+# --- Build session + position caches ------------------------------------
+CLAUDEGREP_TMP="/tmp/claudegrep-${UID}"
+mkdir -p -m 700 "$CLAUDEGREP_TMP" 2>/dev/null
+session_cache=$(mktemp "$CLAUDEGREP_TMP/session-XXXXXX")
+pos_cache=$(mktemp "$CLAUDEGREP_TMP/pos-XXXXXX")
+trap 'rm -f "$session_cache" "$pos_cache"' EXIT
+
+echo "$results" | jq -r '.sessionId // empty' | sort -u | while IFS= read -r sid; do
+  [[ -z "$sid" ]] && continue
+  file=$(find "$CLAUDE_DIR" -name "${sid}.jsonl" -not -path "*/subagents/*" -print -quit 2>/dev/null)
+  if [[ -n "$file" ]]; then
+    # Topic: first real user message
+    topic=$(head -100 "$file" \
+      | jq -r 'select(.type == "user" and .userType == "external")
+        | .message.content
+        | if type == "string" then .
+          else [.[] | select(.type == "text") | .text] | join(" ")
+          end
+        | select(length > 10)
+        | select(startswith("<") | not)
+        | select(startswith("[Request") | not)
+        | select(startswith("{") | not)
+        | select(startswith("This session is being continued") | not)' 2>/dev/null \
+      | head -1 | cut -c1-60)
+
+    # Timestamps
+    start_ts=$(head -1 "$file" | jq -r '.timestamp // empty' 2>/dev/null)
+    end_ts=$(tail -1 "$file" | jq -r '.timestamp // empty' 2>/dev/null)
+
+    printf '%s\t%s\t%s\t%s\n' "$sid" "${topic:-}" "${start_ts:-}" "${end_ts:-}" >> "$session_cache"
+
+    # Build position index: uuid → pos/total/upos/utotal
+    # jq --slurp processes the whole file at once to track running counts
+    jq -r --slurp --arg sid "$sid" '
+      [ .[] | select(.type == "user" or .type == "assistant") ] as $msgs |
+      ($msgs | length) as $total |
+      ([ $msgs[] | select(.type == "user") ] | length) as $utotal |
+      foreach $msgs[] as $m (
+        {pos: 0, upos: 0};
+        .pos += 1 | if $m.type == "user" then .upos += 1 else . end;
+        "\($sid):\($m.uuid)\t\(.pos)\t\($total)\t\(if $m.type == "user" then .upos else 0 end)\t\($utotal)"
+      )
+    ' < "$file" >> "$pos_cache" 2>/dev/null || true
+  fi
+done
+
+# --- Sort results by session recency (most recent first) ----------------
+results=$(echo "$results" | while IFS= read -r line; do
+  sid=$(echo "$line" | jq -r '.sessionId // empty')
+  msg_ts=$(echo "$line" | jq -r '.timestamp // "0000"')
+  end_ts=""
+  if [[ -n "$sid" ]]; then
+    end_ts=$(grep -F "${sid}	" "$session_cache" 2>/dev/null | head -1 | cut -f4)
+  fi
+  printf '%s\t%s\t%s\n' "${end_ts:-0000-00-00T00:00:00}" "$msg_ts" "$line"
+done | sort -t$'\t' -k1,1r -k2,2 | cut -f3-)
+
+# --- Helpers -----------------------------------------------------------
+session_lookup() {
+  local sid="$1"
+  { grep -F "${sid}	" "$session_cache" 2>/dev/null || true; } | head -1 | cut -f2-
+}
+
+# Returns: pos \t total \t upos \t utotal
+pos_lookup() {
+  local sid="$1" uuid="$2"
+  { grep -F "${sid}:${uuid}	" "$pos_cache" 2>/dev/null || true; } | head -1 | cut -f2-
+}
+
+shorten_path() {
+  local p="$1"
+  echo "${p/#$HOME/\~}"
+}
+
+fmt_ts_long() {
+  local ts="$1"
+  [[ -z "$ts" ]] && return
+  local month_num day hour_min
+  month_num=$(echo "$ts" | cut -c6-7)
+  day=$(echo "$ts" | cut -c9-10 | sed 's/^0//')
+  hour_min=$(echo "$ts" | cut -c12-16)
+  local months=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+  local mon="${months[$((10#$month_num - 1))]}"
+  echo "${mon} ${day}, ${hour_min}"
+}
+
+fmt_ts_short() {
+  local ts="$1"
+  [[ -z "$ts" ]] && return
+  echo "$ts" | cut -c12-16
+}
+
+pad_to() {
+  local str="$1" target_w="$2"
+  local visible_len=${#str}
+  local pad=$((target_w - visible_len))
+  if [[ $pad -gt 0 ]]; then
+    printf '%s%*s' "$str" "$pad" ""
+  else
+    echo "$str"
+  fi
+}
+
+# --- Render output ----------------------------------------------------
+render() {
+  local count
+  count=$(echo "$results" | wc -l | tr -d ' ')
+
+  # ── Top banner ────────────────────────────────────────────────────
+  echo ""
+  echo -e "  ${TEAL}${BOLD}  claudegrep${RESET}  ${ORANGE}${BOLD}/${pattern}/${RESET}  ${SLATE}·${RESET}  ${WHITE}${BOLD}${count}${RESET} ${SLATE}result(s)${RESET}"
+  echo ""
+
+  local prev_sid=""
+  echo "$results" | while IFS= read -r line; do
+    msg_type=$(echo "$line" | jq -r '.type')
+    text=$(echo "$line" | jq -r '.text')
+    ts=$(echo "$line" | jq -r '.timestamp // empty')
+    branch=$(echo "$line" | jq -r '.branch // empty')
+    cwd_raw=$(echo "$line" | jq -r '.cwd // empty')
+    sid=$(echo "$line" | jq -r '.sessionId // empty')
+    uuid=$(echo "$line" | jq -r '.uuid // empty')
+
+    # ── Session header box (once per session group) ─────────────────
+    if [[ -n "$sid" && "$sid" != "$prev_sid" ]]; then
+      [[ -n "$prev_sid" ]] && echo ""
+
+      local cache_line topic start_ts end_ts
+      cache_line=$(session_lookup "$sid")
+      topic=$(echo "$cache_line" | cut -f1)
+      start_ts=$(echo "$cache_line" | cut -f2)
+      end_ts=$(echo "$cache_line" | cut -f3)
+
+      [[ -z "$topic" ]] && topic="Session ${sid:0:8}…"
+
+      local cwd_short
+      cwd_short=$(shorten_path "$cwd_raw")
+
+      # Time range
+      local time_str=""
+      if [[ -n "$start_ts" ]]; then
+        local s_fmt e_fmt
+        s_fmt=$(fmt_ts_long "$start_ts")
+        e_fmt=$(fmt_ts_long "$end_ts")
+        if [[ -n "$e_fmt" && "$s_fmt" != "$e_fmt" ]]; then
+          time_str="${s_fmt} → ${e_fmt}"
+        else
+          time_str="${s_fmt}"
+        fi
+      fi
+
+      # Metadata
+      local meta_str=""
+      [[ -n "$branch" ]] && meta_str="${branch}"
+      if [[ -n "$cwd_short" ]]; then
+        [[ -n "$meta_str" ]] && meta_str="${meta_str}  ·  "
+        meta_str="${meta_str}${cwd_short}"
+      fi
+
+      # ── Draw box ────────────────────────────────────────────────
+      local hbar=""
+      for ((i=0; i<BOX_W; i++)); do hbar+="─"; done
+      echo -e "  ${CLOUD}╭${hbar}╮${RESET}"
+
+      local topic_trunc="${topic:0:$((BOX_W - 4))}"
+      local topic_pad
+      topic_pad=$(pad_to "$topic_trunc" $((BOX_W - 4)))
+      echo -e "  ${CLOUD}│${RESET}${BG_BOX}  ${TEAL}${BOLD}${topic_pad}${RESET}${BG_BOX}  ${RESET}${CLOUD}│${RESET}"
+
+      if [[ -n "$meta_str" ]]; then
+        local meta_trunc="${meta_str:0:$((BOX_W - 4))}"
+        local meta_pad
+        meta_pad=$(pad_to "$meta_trunc" $((BOX_W - 4)))
+        echo -e "  ${CLOUD}│${RESET}${BG_BOX}  ${SKY}${meta_pad}${RESET}${BG_BOX}  ${RESET}${CLOUD}│${RESET}"
+      fi
+
+      if [[ -n "$time_str" ]]; then
+        local time_trunc="${time_str:0:$((BOX_W - 4))}"
+        local time_pad
+        time_pad=$(pad_to "$time_trunc" $((BOX_W - 4)))
+        echo -e "  ${CLOUD}│${RESET}${BG_BOX}  ${GOLD}${time_pad}${RESET}${BG_BOX}  ${RESET}${CLOUD}│${RESET}"
+      fi
+
+      echo -e "  ${CLOUD}╰${hbar}╯${RESET}"
+
+      prev_sid="$sid"
+    fi
+
+    # ── Position lookup ─────────────────────────────────────────────
+    local pos_str=""
+    if [[ -n "$sid" && -n "$uuid" ]]; then
+      local pos_line
+      pos_line=$(pos_lookup "$sid" "$uuid")
+      if [[ -n "$pos_line" ]]; then
+        local msg_pos msg_total user_pos user_total
+        msg_pos=$(echo "$pos_line" | cut -f1)
+        msg_total=$(echo "$pos_line" | cut -f2)
+        user_pos=$(echo "$pos_line" | cut -f3)
+        user_total=$(echo "$pos_line" | cut -f4)
+
+        if [[ "$msg_type" == "user" && -n "$user_pos" && "$user_pos" != "0" ]]; then
+          pos_str="${SLATE}depth${RESET}  🧑 ${PEACH}${msg_pos}${RESET}${SLATE}/${msg_total}${RESET}  🧑${SLATE}+${RESET}🤖 ${PEACH}${user_pos}${RESET}${SLATE}/${user_total}${RESET}"
+        elif [[ -n "$msg_pos" ]]; then
+          pos_str="${SLATE}depth${RESET}  🧑 ${PEACH}${msg_pos}${RESET}${SLATE}/${msg_total}${RESET}"
+        fi
+      fi
+    fi
+
+    # ── Message row ─────────────────────────────────────────────────
+    local ts_fmt=""
+    [[ -n "$ts" ]] && ts_fmt=$(fmt_ts_short "$ts")
+
+    if [[ "$msg_type" == "user" ]]; then
+      echo -e "    ${MINT}${BOLD}▸ you${RESET}    ${FAINT}${ts_fmt}${RESET}    ${pos_str}"
+    else
+      echo -e "    ${LAVENDER}${BOLD}▸ claude${RESET} ${FAINT}${ts_fmt}${RESET}    ${pos_str}"
+    fi
+
+    # Message body
+    if [[ ${#text} -gt 500 ]]; then
+      text="${text:0:500}${FAINT}…${RESET}"
+    fi
+    highlighted=$(echo "$text" | GREP_COLOR='1;38;2;255;150;50' grep -i --color=always -E "$pattern" 2>/dev/null || echo "$text")
+    echo -e "      ${highlighted}"
+    echo ""
+  done
+
+  # ── Footer ──────────────────────────────────────────────────────────
+  if [[ "$count" -ge "$max_results" ]]; then
+    echo -e "  ${SLATE}showing first ${WHITE}${BOLD}${max_results}${RESET}${SLATE} — use ${MINT}-n${RESET}${SLATE} to increase${RESET}"
+    echo ""
+  fi
+}
+
+# --- Display with pager -----------------------------------------------
+if [[ "$use_pager" == true ]] && [[ -t 1 ]]; then
+  render | less -RFX
+else
+  render
+fi
